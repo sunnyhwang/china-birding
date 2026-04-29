@@ -9,8 +9,6 @@ Available data:
   - Species lists for a region (not individual observations)
   - Activity/survey metadata (location, date, species count — no species list)
   - Aggregate species frequency (report counts per species in a region/date)
-
-Beijing: province="北京"
 """
 
 import os
@@ -30,12 +28,51 @@ from birdrecord_cli.models.client import (
 # ----------------------------------------------------------------
 DEFAULT_PROVINCE = os.environ.get("BIRDING_PROVINCE", "北京")
 
-BEIJING_DISTRICTS = [
-    "东城区", "西城区", "朝阳区", "丰台区", "石景山区",
-    "海淀区", "门头沟区", "房山区", "通州区", "顺义区",
-    "昌平区", "大兴区", "怀柔区", "平谷区", "密云区",
-    "延庆区",
-]
+# 各省份下属区/县列表（用于按区域统计分析）
+# 可通过 env BIRDING_PROVINCE 切换省份，匹配对应 key
+PROVINCE_DISTRICTS: dict[str, list[str]] = {
+    "北京": [
+        "东城区", "西城区", "朝阳区", "丰台区", "石景山区",
+        "海淀区", "门头沟区", "房山区", "通州区", "顺义区",
+        "昌平区", "大兴区", "怀柔区", "平谷区", "密云区",
+        "延庆区",
+    ],
+    "上海": [
+        "黄浦区", "徐汇区", "长宁区", "静安区", "普陀区",
+        "虹口区", "杨浦区", "闵行区", "宝山区", "嘉定区",
+        "浦东新区", "金山区", "松江区", "青浦区", "奉贤区",
+        "崇明区",
+    ],
+    "广东": [
+        "广州市", "深圳市", "珠海市", "汕头市", "佛山市",
+        "韶关市", "湛江市", "肇庆市", "江门市", "茂名市",
+        "惠州市", "梅州市", "汕尾市", "河源市", "阳江市",
+        "清远市", "东莞市", "中山市", "潮州市", "揭阳市",
+        "云浮市",
+    ],
+    "浙江": [
+        "杭州市", "宁波市", "温州市", "嘉兴市", "湖州市",
+        "绍兴市", "金华市", "衢州市", "舟山市", "台州市",
+        "丽水市",
+    ],
+    "江苏": [
+        "南京市", "无锡市", "徐州市", "常州市", "苏州市",
+        "南通市", "连云港市", "淮安市", "盐城市", "扬州市",
+        "镇江市", "泰州市", "宿迁市",
+    ],
+    "四川": [
+        "成都市", "自贡市", "攀枝花市", "泸州市", "德阳市",
+        "绵阳市", "广元市", "遂宁市", "内江市", "乐山市",
+        "南充市", "眉山市", "宜宾市", "广安市", "达州市",
+        "雅安市", "巴中市", "资阳市",
+    ],
+    "云南": [
+        "昆明市", "曲靖市", "玉溪市", "保山市", "昭通市",
+        "丽江市", "普洱市", "临沧市", "楚雄州", "红河州",
+        "文山州", "西双版纳州", "大理州", "德宏州", "怒江州",
+        "迪庆州",
+    ],
+}
 
 TZ = timezone(timedelta(hours=8))
 
@@ -113,12 +150,13 @@ class BirdRecordSource:
     def get_species_frequency_by_district(
         self, species_name: str, days_back: int = 14
     ) -> list[dict]:
-        """Get a species' report count in each Beijing district.
+        """Get a species' report count in each district of the configured province.
 
         Returns list of {district, reportCount}
         """
         results = []
-        for d in BEIJING_DISTRICTS:
+        districts = PROVINCE_DISTRICTS.get(self.province, [])
+        for d in districts:
             try:
                 freq = self.get_species_frequency(
                     species_name=species_name, days_back=days_back, district=d
@@ -180,7 +218,7 @@ class BirdRecordSource:
         page: int = 1,
         district: Optional[str] = None,
     ) -> list[dict]:
-        """Get recent birding survey activities in Beijing.
+        """Get recent birding survey activities in the configured province (default: 北京).
 
         Returns basic metadata: location, date, observer, total species count.
         (The API does not expose which species were observed.)
@@ -243,10 +281,10 @@ class BirdRecordSource:
 _source: Optional[BirdRecordSource] = None
 
 
-def get_source() -> BirdRecordSource:
+def get_source(province: str = None) -> BirdRecordSource:
     global _source
     if _source is None:
-        _source = BirdRecordSource()
+        _source = BirdRecordSource(province=province or DEFAULT_PROVINCE)
     return _source
 
 

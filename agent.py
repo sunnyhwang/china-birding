@@ -146,6 +146,100 @@ CN_TO_CODE = {}
 for cn, (code, en) in COMMON_SPECIES.items():
     CN_TO_CODE[cn] = code
 
+# ── 科级查询支持 ──────────────────────────────────────
+# 中文科名 → 科拉丁名映射
+# 用于处理 "鹎科鸟类有多少种" 这类查询
+CN_FAMILY_MAP: dict[str, str] = {
+    "鸭科": "Anatidae",
+    "雉科": "Phasianidae",
+    "鹭科": "Ardeidae",
+    "鹮科": "Threskiornithidae",
+    "鹳科": "Ciconiidae",
+    "鹰科": "Accipitridae",
+    "隼科": "Falconidae",
+    "鹤科": "Gruidae",
+    "鸻科": "Charadriidae",
+    "鹬科": "Scolopacidae",
+    "鸥科": "Laridae",
+    "鸬鹚科": "Phalacrocoracidae",
+    "䴙䴘科": "Podicipedidae",
+    "鸠鸽科": "Columbidae",
+    "杜鹃科": "Cuculidae",
+    "鸱鸮科": "Strigidae",
+    "雨燕科": "Apodidae",
+    "翠鸟科": "Alcedinidae",
+    "啄木鸟科": "Picidae",
+    "伯劳科": "Laniidae",
+    "鸦科": "Corvidae",
+    "山雀科": "Paridae",
+    "燕科": "Hirundinidae",
+    "莺科": "Cettiidae",
+    "柳莺科": "Phylloscopidae",
+    "苇莺科": "Acrocephalidae",
+    "鹟科": "Muscicapidae",
+    "鸫科": "Turdidae",
+    "画眉科": "Leiothrichidae",
+    "噪鹛科": "Leiothrichidae",
+    "鹎科": "Pycnonotidae",
+    "椋鸟科": "Sturnidae",
+    "绣眼鸟科": "Zosteropidae",
+    "雀科": "Passeridae",
+    "燕雀科": "Fringillidae",
+    "鹀科": "Emberizidae",
+    "梅花雀科": "Estrildidae",
+    "鹪鹩科": "Troglodytidae",
+    "攀雀科": "Remizidae",
+    "花蜜鸟科": "Nectariniidae",
+    "鹡鸰科": "Motacillidae",
+    "太平鸟科": "Bombycillidae",
+    "黄鹂科": "Oriolidae",
+    "卷尾科": "Dicruridae",
+    "王鹟科": "Monarchidae",
+    "扇尾鹟科": "Rhipiduridae",
+    "百灵科": "Alaudidae",
+    "岩鹨科": "Prunellidae",
+    "旋木雀科": "Certhiidae",
+    "鳾科": "Sittidae",
+    "太阳鸟科": "Nectariniidae",
+    "啄花鸟科": "Dicaeidae",
+    "鹛科": "Timaliidae",
+    "幽鹛科": "Pellorneidae",
+    "鸲科": "Muscicapidae",
+    "地鸫科": "Turdidae",
+}
+
+
+def _load_family_species() -> dict[str, list[str]]:
+    """Build familySciName → list of (cn_name, code) from taxonomy cache."""
+    taxonomy = _load_taxonomy()
+    family_species: dict[str, list[tuple[str, str]]] = {}
+    # taxonomy is keyed by English name, each value has code, familySciName, etc.
+    # We need Chinese names too — they're buried in the map values? No — the keys are EN names.
+    # We'll store by code → (en_name, family_sci_name)
+    code_family: dict[str, str] = {}
+    for en_name, info in taxonomy.items():
+        code = info.get("code", "")
+        family = info.get("familySciName", "")
+        if code and family:
+            code_family[code] = family
+
+    # Also build reverse: family → list of codes
+    for code, family in code_family.items():
+        family_species.setdefault(family, []).append(code)
+
+    return code_family, family_species
+
+
+_FAMILY_CODE_CACHE: Optional[dict[str, str]] = None
+_FAMILY_SPECIES_CACHE: Optional[dict[str, list[str]]] = None
+
+def get_family_data():
+    global _FAMILY_CODE_CACHE, _FAMILY_SPECIES_CACHE
+    if _FAMILY_CODE_CACHE is not None:
+        return _FAMILY_CODE_CACHE, _FAMILY_SPECIES_CACHE
+    _FAMILY_CODE_CACHE, _FAMILY_SPECIES_CACHE = _load_family_species()
+    return _FAMILY_CODE_CACHE, _FAMILY_SPECIES_CACHE
+
 # 热门热点坐标（用于 geo 查询）
 HOTSPOT_COORDS = {
     "奥林匹克森林公园": (39.99, 116.39),
@@ -206,6 +300,16 @@ def classify_query(text: str) -> dict:
             "intent": "species_info" if is_info_query else "species",
             "params": {"species": found_species, "species_code": CN_TO_CODE.get(found_species)}
         }
+
+    # ── 检测科级查询（如"鹎科鸟类有多少种"） ──
+    family_match = re.search(r'([\u4e00-\u9fff]{1,6})科', text)
+    if family_match:
+        family_cn = family_match.group(0)  # e.g. "鹎科"
+        family_sci = CN_FAMILY_MAP.get(family_cn)
+        if family_sci:
+            return {"intent": "family", "params": {"family_cn": family_cn, "family_sci": family_sci}}
+        # Unknown family — still return as species query attempt
+        return {"intent": "species", "params": {"species": family_cn}}
 
     # ── 检测稀有鸟讯（通用） ──
     if any(kw in text for kw in ["稀有", "罕见", "重要", "稀罕", " notable", "特殊", "最近"]):
@@ -597,6 +701,177 @@ def fmt_species(data: dict, species_name: str) -> str:
     return "\n".join(lines)
 
 
+# ══════════════════════════════════════════════════════════════
+# 科级查询（如"鹎科鸟类有多少种、分布如何"）
+# ══════════════════════════════════════════════════════════════
+
+def query_family(family_sci: str, species_limit: int = 30) -> dict:
+    """
+    查询某一科鸟类的物种列表及其在配置区域的分布情况。
+
+    构建方式：
+      - 从 cn_species_map.json（全物种分类数据）匹配 familySciName
+      - 通过 COMMON_SPECIES 获取中文名（仅覆盖常见种，约 142 种）
+      - 仅对有中文名的物种查询 birdrecord.cn 和 eBird
+    """
+    _, family_species = get_family_data()
+    taxonomy = _load_taxonomy()
+
+    codes = family_species.get(family_sci, [])
+    if not codes:
+        return {"error": f"未找到科 {family_sci} 的物种数据"}
+
+    # Build code → cn_name from COMMON_SPECIES (reverse lookup)
+    code_to_cn: dict[str, str] = {}
+    for cn, (code, en) in COMMON_SPECIES.items():
+        code_to_cn[code] = cn
+
+    # Build code → en_name from taxonomy
+    code_to_en: dict[str, str] = {}
+    for en_name, info in taxonomy.items():
+        code = info.get("code", "")
+        if code:
+            code_to_en[code] = en_name
+
+    # Get family common English name
+    family_en = ""
+    for en_name, info in taxonomy.items():
+        if info.get("familySciName") == family_sci:
+            family_en = info.get("familyComName", "")
+            break
+
+    species_in_family = []
+    for code in codes[:species_limit]:
+        en_name = code_to_en.get(code, "")
+        cn_name = code_to_cn.get(code, "")
+        species_in_family.append({
+            "cn_name": cn_name,          # may be empty if not in COMMON_SPECIES
+            "en_name": en_name,
+            "code": code,
+        })
+
+    # Query frequency & observations (only for species with Chinese names)
+    br = get_birdrecord()
+    eb = get_ebird()
+
+    enriched = []
+    for sp in species_in_family:
+        cn_name = sp["cn_name"]
+        code = sp["code"]
+
+        # birdrecord.cn frequency (requires Chinese name)
+        reports = 0
+        top_districts = []
+        if cn_name:
+            try:
+                freq = br.get_species_frequency_by_district(cn_name, days_back=30)
+                reports = sum(f.get("reportCount", 0) for f in freq)
+                top_districts = sorted(freq, key=lambda x: -x.get("reportCount", 0))[:5]
+            except Exception:
+                pass  # no birdrecord.cn data for this species
+
+        # eBird recent observations
+        recent_obs = []
+        try:
+            recent_obs = eb.recent_observations(days_back=14, species_code=code)[:5]
+        except Exception:
+            pass
+
+        enriched.append({
+            **sp,
+            "frequency": {
+                "total_reports": reports,
+                "districts": top_districts,
+            },
+            "recent_obs": recent_obs,
+        })
+
+    # Find the Chinese family name
+    family_cn = ""
+    for cn_f, sci_f in CN_FAMILY_MAP.items():
+        if sci_f == family_sci:
+            family_cn = cn_f
+            break
+
+    return {
+        "family_cn": family_cn,
+        "family_sci": family_sci,
+        "family_en": family_en,
+        "total_codes": len(codes),
+        "species_list": enriched,
+    }
+
+
+def _build_en_to_cn_map(taxonomy: dict) -> dict[str, str]:
+    """Build English name → Chinese name lookup from taxonomy + COMMON_SPECIES."""
+    en_to_cn = {en: cn for cn, (code, en) in COMMON_SPECIES.items()}
+    return en_to_cn
+
+
+def fmt_family(data: dict) -> str:
+    """格式化科级查询结果。"""
+    if "error" in data:
+        return f"⚠️ {data['error']}"
+
+    lines = ["━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+
+    family_cn = data.get("family_cn", "")
+    family_en = data.get("family_en", "")
+    total_codes = data.get("total_codes", 0)
+    species_list = data.get("species_list", [])
+
+    title = f"{family_cn}({family_en})" if family_cn else f"{family_en or data.get('family_sci','')}"
+    has_record = [s for s in species_list if s["frequency"]["total_reports"] > 0 or s["recent_obs"]]
+
+    lines.append(f"  🌿 {title} — 该科 {total_codes} 种，区域内近期有记录 {len(has_record)} 种")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    for sp in species_list:
+        cn = sp.get("cn_name", "")
+        en = sp.get("en_name", "?")
+        code = sp.get("code", "")
+        freq = sp.get("frequency", {})
+        reports = freq.get("total_reports", 0)
+        districts = freq.get("districts", [])
+        recent = sp.get("recent_obs", [])
+
+        # Skip species with zero data unless they have a Chinese name
+        if reports == 0 and not recent:
+            if not cn:
+                continue  # skip unknown species with no records
+            # For species without Chinese name, still show a minimal entry
+            label = f"{en}" if not cn else f"{cn}({en})"
+            label += f" — ❌ 暂无该区域记录"
+            lines.append(f"  ▸ {label}")
+            continue
+
+        cn_name_missing = not cn
+        label = f"{cn}({en})" if cn else en
+
+        parts = [f"  ▸ {label}"]
+
+        if reports > 0:
+            parts[0] += f" — {reports}次报告"
+            if districts:
+                dist_str = " | ".join(f"{d['district']}{d['reportCount']}次" for d in districts[:3])
+                parts.append(f"    📍 区域分布: {dist_str}")
+
+        if recent:
+            locs = set(o.get("locName", "?") for o in recent[:3])
+            parts.append(f"    📡 eBird: {', '.join(locs)}")
+
+        if cn_name_missing:
+            parts.append(f"    ⚠️ 暂无中文匹配，仅显示英文名")
+
+        lines.extend(parts)
+
+    if not has_record:
+        lines.append("  📭 区域内近期暂无该科鸟类记录")
+
+    lines.append(f"\n  📊 数据: eBird + birdrecord.cn · {datetime.now().strftime('%m-%d %H:%M')}")
+    return "\n".join(lines)
+
+
 def fmt_hotspot(data: dict) -> str:
     """格式化热点查询结果。"""
     if "error" in data:
@@ -791,6 +1066,14 @@ def query_birds(query: str) -> str:
                 "  🔹 装备: 双筒望远镜 8×42\n"
                 "\n"
                 "  想要更详细的？告诉我具体想去哪！")
+
+    elif intent == "family":
+        family_sci = params.get("family_sci", "")
+        family_cn = params.get("family_cn", "")
+        data = query_family(family_sci)
+        if "error" in data:
+            return f"⚠️ 查询 {family_cn} 数据时出错: {data['error']}"
+        return fmt_family(data)
     
     return "🐦 没太明白你问的是什么，试试：\n  • 「最近有什么稀有鸟？」\n  • 「卷羽鹈鹕还在吗？」\n  • 「沙河现在怎么样？」\n  • 「最热的鸟点是哪？」"
 
