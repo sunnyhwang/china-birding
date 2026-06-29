@@ -8,12 +8,16 @@ Requires free API key from https://ebird.org/api/keygen
 import csv
 import io
 import json
+import logging
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
 
 
 class EBirdSource:
@@ -40,9 +44,15 @@ class EBirdSource:
 
     def _fetch(self, path: str, params: dict[str, str] = None) -> Any:
         """GET from eBird API with caching."""
+        if not self._api_key:
+            raise RuntimeError(
+                "EBIRD_API_KEY is required for live eBird queries. "
+                "Set it in config.local.yaml or in the process environment."
+            )
+
         url = f"{self.BASE}{path}"
         if params:
-            qs = "&".join(f"{k}={v}" for k, v in params.items() if v)
+            qs = urllib.parse.urlencode({k: v for k, v in params.items() if v})
             url = f"{url}?{qs}"
 
         now = time.time()
@@ -62,7 +72,17 @@ class EBirdSource:
                 return data
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
+            logger.info(
+                "eBird API returned HTTP %s for %s: %s",
+                e.code,
+                path,
+                body,
+                exc_info=True,
+            )
             raise RuntimeError(f"eBird API error {e.code} for {path}: {body}") from e
+        except urllib.error.URLError as e:
+            logger.info("eBird API request failed for %s: %s", path, e, exc_info=True)
+            raise RuntimeError(f"eBird API request failed for {path}: {e}") from e
 
     def _fetch_csv(self, path: str) -> list[dict[str, str]]:
         """GET CSV endpoint, return list of dicts."""

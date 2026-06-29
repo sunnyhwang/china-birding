@@ -2,8 +2,9 @@
 """
 BirdRecord.cn (中国观鸟记录中心) data source.
 
-Uses the birdrecord-cli library (v0.1.3) to query the official API.
-Uses a share-level token — no user login required.
+Uses the third-party birdrecord-cli library (v0.1.3) to query BirdRecord
+mini-program endpoints. The default client token is "share"; this project does
+not require or configure a personal BirdRecord API key.
 
 Available data:
   - Species lists for a region (not individual observations)
@@ -11,17 +12,30 @@ Available data:
   - Aggregate species frequency (report counts per species in a region/date)
 """
 
+import logging
 import os
 import sys
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from birdrecord_cli.client import BirdrecordClient
-from birdrecord_cli.models.client import (
-    CommonPageActivityRequest,
-    CommonListActivityTaxonRequest,
-    ChartStatisticsTaxonRequest,
-)
+try:
+    from birdrecord_cli.client import BirdrecordClient
+    from birdrecord_cli.models.client import (
+        CommonPageActivityRequest,
+        CommonListActivityTaxonRequest,
+        ChartStatisticsTaxonRequest,
+    )
+except ImportError as exc:
+    BirdrecordClient = None
+    CommonPageActivityRequest = None
+    CommonListActivityTaxonRequest = None
+    ChartStatisticsTaxonRequest = None
+    _BIRDRECORD_IMPORT_ERROR = exc
+else:
+    _BIRDRECORD_IMPORT_ERROR = None
+
+
+logger = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------
 # Constants — override via env var BIRDING_PROVINCE (e.g. "上海", "广东")
@@ -84,10 +98,14 @@ class BirdRecordSource:
     """Query birdrecord.cn for bird data. Configurable per province.
 
     Set env BIRDING_PROVINCE to change region (default: 北京).
-    Set env BIRDRECORD_SHARE_TOKEN for authenticated access (optional).
     """
 
     def __init__(self, province: str = None):
+        if BirdrecordClient is None:
+            raise RuntimeError(
+                "birdrecord-cli is not installed. Run `pip install -r requirements.txt` "
+                "before using China BirdRecord data."
+            ) from _BIRDRECORD_IMPORT_ERROR
         self._client = BirdrecordClient()
         self.province = province or DEFAULT_PROVINCE
 
@@ -145,6 +163,16 @@ class BirdRecordSource:
             results.sort(key=lambda x: -x["reportCount"])
             return results
         except Exception:
+            logger.debug(
+                "BirdRecord species frequency query failed",
+                exc_info=True,
+                extra={
+                    "species_name": species_name,
+                    "province": self.province,
+                    "district": district,
+                    "days_back": days_back,
+                },
+            )
             return []  # silent fail — some districts have no data
 
     def get_species_frequency_by_district(
@@ -167,6 +195,16 @@ class BirdRecordSource:
                         "reportCount": freq[0]["reportCount"],
                     })
             except Exception:
+                logger.debug(
+                    "BirdRecord district frequency query failed",
+                    exc_info=True,
+                    extra={
+                        "species_name": species_name,
+                        "province": self.province,
+                        "district": d,
+                        "days_back": days_back,
+                    },
+                )
                 pass  # skip districts with no data
         return results
 
@@ -204,7 +242,12 @@ class BirdRecordSource:
                 })
             return results
         except Exception as e:
-            print(f"[birdrecord] get_monthly_statistics error: {e}", file=sys.stderr)
+            logger.info(
+                "BirdRecord monthly statistics query failed: %s",
+                e,
+                exc_info=True,
+                extra={"species_name": species_name, "province": self.province},
+            )
             return []
 
     # ----------------------------------------------------------
@@ -254,8 +297,35 @@ class BirdRecordSource:
                 })
             return activities
         except Exception as e:
-            print(f"[birdrecord] get_recent_activities error: {e}", file=sys.stderr)
+            logger.info(
+                "BirdRecord recent activities query failed: %s",
+                e,
+                exc_info=True,
+                extra={
+                    "province": self.province,
+                    "district": district,
+                    "days_back": days_back,
+                    "limit": limit,
+                    "page": page,
+                },
+            )
             return []
+
+    @staticmethod
+    def format_activity(activity: dict) -> str:
+        """Format a BirdRecord activity summary for CLI output."""
+        date = activity.get("date", "?")
+        location = activity.get("location") or activity.get("address") or "未知地点"
+        district = activity.get("district") or ""
+        species_count = activity.get("speciesCount", "?")
+        observer = activity.get("observer") or "匿名"
+
+        district_part = f" · {district}" if district else ""
+        return f"  [{date}] {location}{district_part} — {observer} ({species_count}种)"
+
+    def recent_activities(self, *args, **kwargs) -> list[dict]:
+        """Backward-compatible alias for older callers."""
+        return self.get_recent_activities(*args, **kwargs)
 
     # ----------------------------------------------------------
     # Notable / rare species detection

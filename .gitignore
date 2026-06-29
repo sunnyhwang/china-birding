@@ -1,6 +1,6 @@
 *.pyc
 __pycache__/
-.env
+config.local.yaml
 venv/
 .venv/
 dist/

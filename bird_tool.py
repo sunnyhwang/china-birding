@@ -16,10 +16,19 @@ Usage:
 import os
 import argparse
 import json
+import logging
 import sys
 from datetime import datetime, timezone
 
-sys.stdout.reconfigure(encoding="utf-8")
+from config import load_local_config
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
+
+logger = logging.getLogger(__name__)
+
+load_local_config()
 
 # ═══════════════════════════════════════════════
 # Static Knowledge Base
@@ -172,7 +181,7 @@ def get_ebird_source():
     from sources.ebird_source import EBirdSource
     key = os.environ.get("EBIRD_API_KEY")
     if not key:
-        print("⚠️  请设置环境变量 EBIRD_API_KEY (免费申请: https://ebird.org/api/keygen)")
+        print("⚠️  请设置 EBIRD_API_KEY，或在 config.local.yaml 中填写 ebird.api_key")
         key = ""
     return EBirdSource(key)
 
@@ -286,13 +295,14 @@ def cmd_live(args):
         lines.append(f"\n🇨🇳 中国观鸟记录中心 · 近期记录")
         try:
             br = get_birdrecord_source()
-            activities = br.recent_activities(limit=10)
+            activities = br.get_recent_activities(limit=10)
             if activities:
                 for act in activities:
                     lines.append(br.format_activity(act))
             else:
                 lines.append("  （暂无该地区记录）")
         except Exception as e:
+            logger.info("Failed to fetch BirdRecord recent activities: %s", e, exc_info=True)
             lines.append(f"  ⚠️ {e}")
 
     # Summary
@@ -307,16 +317,16 @@ def cmd_live(args):
 def cmd_hotspots(args):
     """List all Beijing hotspots from eBird."""
     eb = get_ebird_source()
-    print(f"\n📌 观鸟热点 (eBird) — {len(eb.hotspot_list())} 个")
-    print(f"{'='*60}")
 
     try:
         hotspots = eb.hotspot_list()
+        print(f"\n📌 观鸟热点 (eBird) — {len(hotspots)} 个")
+        print(f"{'='*60}")
         # Sort by numSpecies descending
         def _sp(h):
             try:
                 return int(h.get("numSpecies", 0))
-            except:
+            except (TypeError, ValueError):
                 return 0
         hotspots.sort(key=_sp, reverse=True)
 
@@ -326,6 +336,7 @@ def cmd_hotspots(args):
             last = h.get("lastDate", "?")
             print(f"  {name:45s} | {str(sp):>4s} 种 | 最近: {last}")
     except Exception as e:
+        logger.info("Failed to fetch eBird hotspots: %s", e, exc_info=True)
         print(f"  ⚠️ {e}")
     print()
 

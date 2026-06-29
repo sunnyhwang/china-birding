@@ -1,3 +1,4 @@
 # 北京观鸟工具依赖
+# birdrecord-cli requires Python >=3.12.
 birdrecord-cli>=0.1.3
 httpx>=0.28

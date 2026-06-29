@@ -1,0 +1,15 @@
+# Copy this file to config.local.yaml and fill in your local values.
+# config.local.yaml is ignored by git.
+
+ebird:
+  # Required for live eBird API calls.
+  # Get a free key from https://ebird.org/api/keygen
+  api_key: ""
+
+birding:
+  # Default region. Per-query region names such as 上海 or 广东 still override this.
+  region: CN-11
+  province: 北京
+
+# BirdRecord/birdreport.cn currently uses the third-party birdrecord-cli package.
+# The current integration does not require a personal BirdRecord API key.

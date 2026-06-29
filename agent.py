@@ -12,13 +12,16 @@ eBird 区域代码: CN-11 = 北京, CN-31 = 上海, CN-44 = 广东 ...
   result = query_birds("卷羽鹈鹕最近在哪出现？")
   print(result)
 """
-import json, os, re, sys
-from datetime import datetime, timezone
+import json, logging, os, re, sys
+from contextlib import contextmanager
+from datetime import datetime
 from typing import Optional
 
-sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 sys.path.insert(0, os.path.dirname(__file__))
 
+from config import load_local_config
 from sources.ebird_source import EBirdSource
 from sources.birdrecord_source import BirdRecordSource
 
@@ -27,13 +30,8 @@ from sources.birdrecord_source import BirdRecordSource
 # 免费申请: https://ebird.org/api/keygen
 # ══════════════════════════════════════════════════════════════
 
-EBIRD_KEY = os.environ.get("EBIRD_API_KEY")
-if not EBIRD_KEY:
-    raise RuntimeError(
-        "❌ 请设置环境变量 EBIRD_API_KEY\n"
-        "   免费申请: https://ebird.org/api/keygen\n"
-        "   或写入 .env 文件: EBIRD_API_KEY=你的密钥"
-    )
+logger = logging.getLogger(__name__)
+load_local_config()
 
 # 区域设置 — 通过环境变量 BIRDING_REGION 切换省份
 #   默认 CN-11 (北京), 可改为 CN-31 (上海), CN-44 (广东) 等
@@ -53,14 +51,21 @@ _birdrecord: Optional[BirdRecordSource] = None
 
 def get_ebird():
     global _ebird
-    if _ebird is None:
-        _ebird = EBirdSource(EBIRD_KEY)
+    key = os.environ.get("EBIRD_API_KEY")
+    if not key:
+        raise RuntimeError(
+            "请设置 EBIRD_API_KEY，或在 config.local.yaml 中填写 ebird.api_key。"
+            "免费申请: https://ebird.org/api/keygen"
+        )
+    if _ebird is None or getattr(_ebird, "_api_key", None) != key:
+        _ebird = EBirdSource(key)
     return _ebird
 
 def get_birdrecord():
     global _birdrecord
-    if _birdrecord is None:
-        _birdrecord = BirdRecordSource(province=BIRDING_PROVINCE)
+    province = os.environ.get("BIRDING_PROVINCE", BIRDING_PROVINCE)
+    if _birdrecord is None or getattr(_birdrecord, "province", None) != province:
+        _birdrecord = BirdRecordSource(province=province)
     return _birdrecord
 
 # ══════════════════════════════════════════════════════════════
@@ -83,6 +88,27 @@ HOTSPOT_ALIAS = {
     "南海子": "南海子湿地公园",
     "温榆河": "温榆河公园",
     "十渡": "十渡",
+}
+
+REGION_ALIASES: dict[str, tuple[str, str]] = {
+    "北京": ("CN-11", "北京"),
+    "beijing": ("CN-11", "北京"),
+    "上海": ("CN-31", "上海"),
+    "shanghai": ("CN-31", "上海"),
+    "广东": ("CN-44", "广东"),
+    "guangdong": ("CN-44", "广东"),
+    "浙江": ("CN-33", "浙江"),
+    "zhejiang": ("CN-33", "浙江"),
+    "江苏": ("CN-32", "江苏"),
+    "jiangsu": ("CN-32", "江苏"),
+    "四川": ("CN-51", "四川"),
+    "sichuan": ("CN-51", "四川"),
+    "云南": ("CN-53", "云南"),
+    "yunnan": ("CN-53", "云南"),
+}
+
+REGION_CODE_TO_PROVINCE = {
+    region: province for region, province in REGION_ALIASES.values()
 }
 
 # 常见物种中英文名映射（eBird 物种编码，已从官方 taxonomy 校正）
@@ -240,6 +266,74 @@ def get_family_data():
     _FAMILY_CODE_CACHE, _FAMILY_SPECIES_CACHE = _load_family_species()
     return _FAMILY_CODE_CACHE, _FAMILY_SPECIES_CACHE
 
+
+def extract_region(text: str) -> dict:
+    """Extract a query-scoped region override from natural language."""
+    text_lower = text.lower()
+    for alias, (region, province) in REGION_ALIASES.items():
+        if alias in text_lower or alias in text:
+            return {"region": region, "province": province}
+
+    code_match = re.search(r"\bCN-\d{2}\b", text, flags=re.IGNORECASE)
+    if code_match:
+        region = code_match.group(0).upper()
+        return {"region": region, "province": REGION_CODE_TO_PROVINCE.get(region)}
+
+    return {}
+
+
+@contextmanager
+def scoped_region(params: dict):
+    """Temporarily apply a query-specific eBird/BirdRecord region."""
+    old_region = os.environ.get("BIRDING_REGION")
+    old_province = os.environ.get("BIRDING_PROVINCE")
+
+    region = params.get("region")
+    province = params.get("province")
+    try:
+        if region:
+            os.environ["BIRDING_REGION"] = region
+        if province:
+            os.environ["BIRDING_PROVINCE"] = province
+        yield
+    finally:
+        if old_region is None:
+            os.environ.pop("BIRDING_REGION", None)
+        else:
+            os.environ["BIRDING_REGION"] = old_region
+
+        if old_province is None:
+            os.environ.pop("BIRDING_PROVINCE", None)
+        else:
+            os.environ["BIRDING_PROVINCE"] = old_province
+
+
+def current_region_label() -> str:
+    region = os.environ.get("BIRDING_REGION", BIRDING_REGION)
+    province = os.environ.get("BIRDING_PROVINCE", BIRDING_PROVINCE)
+    return f"{province} ({region})" if province else region
+
+
+def extract_visit_window(text: str) -> str:
+    text_lower = text.lower()
+    day = ""
+    if any(kw in text for kw in ["周六", "星期六"]) or "saturday" in text_lower:
+        day = "周六"
+    elif any(kw in text for kw in ["周日", "星期日", "星期天"]) or "sunday" in text_lower:
+        day = "周日"
+    elif "周末" in text or "weekend" in text_lower:
+        day = "周末"
+
+    time_of_day = ""
+    if any(kw in text for kw in ["早上", "上午"]) or "morning" in text_lower:
+        time_of_day = "上午"
+    elif "下午" in text or "afternoon" in text_lower:
+        time_of_day = "下午"
+    elif "傍晚" in text or "evening" in text_lower:
+        time_of_day = "傍晚"
+
+    return f"{day}{time_of_day}" or day or time_of_day or "周末"
+
 # 热门热点坐标（用于 geo 查询）
 HOTSPOT_COORDS = {
     "奥林匹克森林公园": (39.99, 116.39),
@@ -267,16 +361,37 @@ def classify_query(text: str) -> dict:
         "params": { ... }
       }
     """
-    text_clean = text.strip().lower()
-    
+    region_params = extract_region(text)
+
+    def result(intent: str, params: Optional[dict] = None) -> dict:
+        merged = dict(region_params)
+        if params:
+            merged.update(params)
+        return {"intent": intent, "params": merged}
+
     # ── 检测稀有鸟讯（优先级高于物种匹配） ──
     is_notable = any(kw in text for kw in ["稀有", "罕见", "重要鸟讯", "警报", "稀罕", "特殊", "最近有什么"])
     if is_notable:
-        return {"intent": "notable", "params": {}}
+        return result("notable")
 
     # ── 检测热点排行 ──
     if any(kw in text for kw in ["热点排名", "热点排行", "最热的鸟点", "鸟点排名", "排名"]):
-        return {"intent": "rankings", "params": {}}
+        return result("rankings")
+
+    # ── 检测明确的新手/攻略意图，避免把“去哪观鸟”误识别成鸟名 ──
+    if any(kw in text for kw in ["新手", "攻略", "指南"]):
+        return result("guide")
+
+    # ── 检测科级查询（如"鹎科鸟类有多少种"） ──
+    for family_cn, family_sci in sorted(CN_FAMILY_MAP.items(), key=lambda x: -len(x[0])):
+        if family_cn in text:
+            return result("family", {"family_cn": family_cn, "family_sci": family_sci})
+
+    family_match = re.search(r'([\u4e00-\u9fff]{1,6})科', text)
+    if family_match:
+        family_cn = family_match.group(0)  # e.g. "鹎科"
+        # Unknown family — still return as species query attempt
+        return result("species", {"species": family_cn})
 
     # ── 检测物种查询 ──
     # 模式: "XX鸟还在北京吗" "最近XX在哪" "XX是什么鸟" "XX的记录"
@@ -287,58 +402,47 @@ def classify_query(text: str) -> dict:
             found_species = cn_name
             break
     if not found_species:
-        # 尝试正则匹配：常见鸟名后缀（排除"鸟点"这类组合）
-        # 先剔除 "鸟点"
-        text_no_spot = text.replace("鸟点", "XX")
+        # 尝试正则匹配：常见鸟名后缀（排除"鸟点"、"观鸟"这类通用词）
+        text_no_spot = text.replace("鸟点", "XX").replace("观鸟", "XX")
         cn_pattern = re.findall(r'[\u4e00-\u9fff]{2,6}(?:鸟|鹀|鹟|鸲|鸻|鹬|鸭|雁|鹤|鹭|鹰|隼|鸮|鹃|莺|鸫|雀|鸦|鹎|鸲|鸰)', text_no_spot)
         if cn_pattern:
             found_species = cn_pattern[0]
 
     if found_species:
         is_info_query = any(kw in text for kw in ["是什么", "是什么鸟", "介绍", "百科", "特征", "长什么样"])
-        return {
-            "intent": "species_info" if is_info_query else "species",
-            "params": {"species": found_species, "species_code": CN_TO_CODE.get(found_species)}
-        }
-
-    # ── 检测科级查询（如"鹎科鸟类有多少种"） ──
-    family_match = re.search(r'([\u4e00-\u9fff]{1,6})科', text)
-    if family_match:
-        family_cn = family_match.group(0)  # e.g. "鹎科"
-        family_sci = CN_FAMILY_MAP.get(family_cn)
-        if family_sci:
-            return {"intent": "family", "params": {"family_cn": family_cn, "family_sci": family_sci}}
-        # Unknown family — still return as species query attempt
-        return {"intent": "species", "params": {"species": family_cn}}
+        return result(
+            "species_info" if is_info_query else "species",
+            {"species": found_species, "species_code": CN_TO_CODE.get(found_species)},
+        )
 
     # ── 检测稀有鸟讯（通用） ──
     if any(kw in text for kw in ["稀有", "罕见", "重要", "稀罕", " notable", "特殊", "最近"]):
-        return {"intent": "notable", "params": {}}
+        return result("notable")
     
     # ── 检测热点查询 ──
     for alias, full_name in sorted(HOTSPOT_ALIAS.items(), key=lambda x: -len(x[0])):
         if alias in text:
-            return {"intent": "hotspot", "params": {"hotspot": full_name}}
+            return result("hotspot", {"hotspot": full_name})
     
     # ── 检测地理查询 ──
     geo_match = re.search(r'(\d+\.?\d*)\s*[°度,，\s]\s*(\d+\.?\d*)', text)
     if geo_match:
-        return {"intent": "geo", "params": {"lat": float(geo_match.group(1)), "lng": float(geo_match.group(2))}}
+        return result("geo", {"lat": float(geo_match.group(1)), "lng": float(geo_match.group(2))})
     
     # ── 检测热点排行 ──
     if any(kw in text for kw in ["热点", "排名", "排行", "最热", "鸟点", "去哪"]):
-        return {"intent": "rankings", "params": {}}
+        return result("rankings")
     
     # ── 检测当前季节 ──
     if any(kw in text for kw in ["这个月", "本月", "季节", "迁徙", "现在看什么"]):
-        return {"intent": "seasonal", "params": {}}
+        return result("seasonal")
     
     # ── 检测攻略 ──
     if any(kw in text for kw in ["攻略", "指南", "推荐", "建议", "新手"]):
-        return {"intent": "guide", "params": {}}
+        return result("guide")
     
     # ── 默认：返回近期概览 ──
-    return {"intent": "notable", "params": {}}
+    return result("notable")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -350,8 +454,8 @@ def query_notable(days_back: int = 7) -> list[dict]:
     results = []
 
     # 1. eBird 稀有鸟讯
-    eb = get_ebird()
     try:
+        eb = get_ebird()
         eb_data = eb.notable_observations(days_back=days_back, max_results=20)
         for o in eb_data:
             results.append({
@@ -362,12 +466,13 @@ def query_notable(days_back: int = 7) -> list[dict]:
                 "count": o.get("howMany", 1),
                 "source": "eBird",
             })
-    except Exception:
-        pass
+    except Exception as e:
+        logger.info("eBird notable query failed: %s", e, exc_info=True)
+        results.append({"source": "eBird", "error": str(e)})
 
     # 2. birdrecord.cn 低频率物种（reportCount ≤ 3 的物种）
-    br = get_birdrecord()
     try:
+        br = get_birdrecord()
         br_rare = br.get_notable_species(days_back=max(days_back * 2, 14), max_reports=3)
         for o in br_rare:
             results.append({
@@ -379,8 +484,9 @@ def query_notable(days_back: int = 7) -> list[dict]:
                 "source": "birdrecord.cn",
                 "note": f"近{max(days_back * 2, 14)}天仅{o.get('reportCount', 1)}次报告",
             })
-    except Exception:
-        pass
+    except Exception as e:
+        logger.info("BirdRecord notable query failed: %s", e, exc_info=True)
+        results.append({"source": "birdrecord.cn", "error": str(e)})
 
     return results
 
@@ -412,29 +518,33 @@ def query_species_recent(species_name: str, days_back: int = 30) -> dict:
             "summary": str,       # 融合后的文字摘要
         }
     """
-    eb = get_ebird()
-    br = get_birdrecord()
+    errors = []
 
     # 1. eBird
     ebird_results = []
     code = CN_TO_CODE.get(species_name)
-    if code:
-        try:
+    try:
+        eb = get_ebird()
+        if code:
             raw = eb.recent_observations(species_code=code, days_back=days_back, max_results=20)
             ebird_results = _normalize_ebird_obs(raw)
-        except Exception:
-            pass
-    else:
-        try:
+        else:
             all_obs = eb.recent_observations(days_back=days_back, max_results=100)
             raw = [o for o in all_obs if species_name in o.get("comName", "") or species_name in o.get("sciName", "")]
             ebird_results = _normalize_ebird_obs(raw)
-        except Exception:
-            pass
+    except Exception as e:
+        logger.info(
+            "eBird species query failed for %s: %s",
+            species_name,
+            e,
+            exc_info=True,
+        )
+        errors.append({"source": "eBird", "message": str(e)})
 
     # 2. birdrecord.cn — 报告频率（该物种在 birdrecord.cn 上的报告次数）
-    birdrecord_result = {}
+    birdrecord_result = {"total_reports": 0, "districts": []}
     try:
+        br = get_birdrecord()
         br_freq = br.get_species_frequency(
             species_name=species_name, days_back=days_back
         )
@@ -449,8 +559,14 @@ def query_species_recent(species_name: str, days_back: int = 30) -> dict:
             "total_reports": br_count,
             "districts": br_districts,
         }
-    except Exception:
-        birdrecord_result = {"total_reports": 0, "districts": []}
+    except Exception as e:
+        logger.info(
+            "BirdRecord species query failed for %s: %s",
+            species_name,
+            e,
+            exc_info=True,
+        )
+        errors.append({"source": "birdrecord.cn", "message": str(e)})
 
     # 3. 物种百科信息
     info = query_species_info(species_name)
@@ -481,13 +597,14 @@ def query_species_recent(species_name: str, days_back: int = 30) -> dict:
         "birdrecord": birdrecord_result,
         "summary": "\n".join(summary_parts) if summary_parts else "暂无记录",
         "species_info": info,
+        "errors": errors,
     }
 
 
-def query_hotspot(hotspot_name: str, days_back: int = 7) -> dict:
+def query_hotspot(hotspot_name: str, days_back: int = 7, max_results: int = 20) -> dict:
     """查询某个热点的近期记录，返回热点信息和观察列表。"""
-    eb = get_ebird()
     try:
+        eb = get_ebird()
         hotspots = eb.hotspot_list()
         q = hotspot_name.lower()
         scored = []
@@ -499,43 +616,337 @@ def query_hotspot(hotspot_name: str, days_back: int = 7) -> dict:
                 scored.append((1, h))
             elif q in name:
                 scored.append((2, h))
-        scored.sort(key=lambda x: x[0])
         if not scored:
             return {"error": f"未找到热点 '{hotspot_name}'"}
-        match = scored[0][1]
-        obs = eb.hotspot_observations(match["locId"], days_back=days_back, max_results=20)
+
+        def _last_date_value(hotspot: dict) -> float:
+            raw = hotspot.get("lastDate", "")
+            for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                try:
+                    return datetime.strptime(raw[:16] if "%H" in fmt else raw[:10], fmt).timestamp()
+                except (TypeError, ValueError):
+                    continue
+            return 0
+
+        def _num_species(hotspot: dict) -> int:
+            try:
+                return int(hotspot.get("numSpecies", 0))
+            except (TypeError, ValueError):
+                return 0
+
+        scored.sort(key=lambda x: (x[0], -_last_date_value(x[1]), -_num_species(x[1])))
+        primary = scored[0]
+        related = sorted(
+            scored[1:],
+            key=lambda x: (-_last_date_value(x[1]), x[0], -_num_species(x[1])),
+        )
+
+        match = primary[1]
+        obs = []
+        fallback_used = False
+        candidates = [primary] + related
+        for index, (_, candidate) in enumerate(candidates):
+            candidate_obs = eb.hotspot_observations(
+                candidate["locId"],
+                days_back=days_back,
+                max_results=max_results,
+            )
+            if candidate_obs or index == len(candidates) - 1:
+                match = candidate
+                obs = candidate_obs
+                fallback_used = index > 0
+                break
+
         return {
             "hotspot": match,
             "observations": obs,
+            "matched_hotspots": [
+                {
+                    "locName": h.get("locName", ""),
+                    "locId": h.get("locId", ""),
+                    "lastDate": h.get("lastDate", ""),
+                    "numSpecies": h.get("numSpecies", ""),
+                }
+                for _, h in scored[:10]
+            ],
+            "fallback_used": fallback_used,
         }
     except Exception as e:
+        logger.info("Hotspot query failed for %s: %s", hotspot_name, e, exc_info=True)
         return {"error": str(e)}
+
+
+def _region_params(region: Optional[str] = None, province: Optional[str] = None) -> dict:
+    """Normalize explicit region/province arguments into scoped-region params."""
+    params = {}
+
+    if region:
+        extracted = extract_region(region)
+        if extracted:
+            params.update(extracted)
+        elif re.fullmatch(r"CN-\d{2}", region, flags=re.IGNORECASE):
+            code = region.upper()
+            params["region"] = code
+            params["province"] = REGION_CODE_TO_PROVINCE.get(code)
+        else:
+            params["region"] = region
+
+    if province:
+        extracted = extract_region(province)
+        if extracted:
+            params.update(extracted)
+        else:
+            params["province"] = province
+            for known_region, known_province in REGION_CODE_TO_PROVINCE.items():
+                if known_province == province:
+                    params.setdefault("region", known_region)
+                    break
+
+    return params
+
+
+def resolve_region(query_or_region: str = "") -> dict:
+    """Resolve a query-scoped birding region, defaulting to the configured Beijing region."""
+    explicit = extract_region(query_or_region) if query_or_region else {}
+    if explicit:
+        return {
+            "region": explicit.get("region"),
+            "province": explicit.get("province"),
+            "label": (
+                f"{explicit.get('province')} ({explicit.get('region')})"
+                if explicit.get("province") else explicit.get("region")
+            ),
+            "source": "query",
+        }
+
+    region = os.environ.get("BIRDING_REGION", BIRDING_REGION)
+    province = os.environ.get("BIRDING_PROVINCE", REGION_CODE_TO_PROVINCE.get(region, BIRDING_PROVINCE))
+    return {
+        "region": region,
+        "province": province,
+        "label": f"{province} ({region})" if province else region,
+        "source": "default",
+    }
+
+
+def list_regions() -> list[dict]:
+    """List built-in region aliases that the Nanobot layer can offer or resolve."""
+    by_region = {}
+    for alias, (region, province) in REGION_ALIASES.items():
+        entry = by_region.setdefault(
+            region,
+            {"region": region, "province": province, "aliases": []},
+        )
+        entry["aliases"].append(alias)
+
+    default_region = os.environ.get("BIRDING_REGION", BIRDING_REGION)
+    rows = []
+    for entry in by_region.values():
+        rows.append({
+            **entry,
+            "label": f"{entry['province']} ({entry['region']})",
+            "is_default": entry["region"] == default_region,
+        })
+    return sorted(rows, key=lambda item: (not item["is_default"], item["province"]))
+
+
+def resolve_place(query_or_place: str) -> dict:
+    """Resolve a known Beijing hotspot alias without making live API calls."""
+    text = query_or_place or ""
+    for alias, full_name in sorted(HOTSPOT_ALIAS.items(), key=lambda x: -len(x[0])):
+        if alias in text:
+            return {"place": full_name, "alias": alias, "source": "alias"}
+    return {"place": text.strip(), "alias": "", "source": "literal"}
+
+
+def _static_hotspot_guides(query: str = "") -> list[dict]:
+    """Return static Beijing guide entries, optionally filtered by alias/name."""
+    try:
+        from bird_tool import HOTSPOTS
+    except Exception as e:
+        logger.info("Failed to load static hotspot guide: %s", e, exc_info=True)
+        return []
+
+    place = resolve_place(query).get("place", "") if query else ""
+    text = query.lower()
+    matches = []
+    for item in HOTSPOTS:
+        name = item.get("name", "")
+        haystack = name.lower()
+        if place and place not in name and text not in haystack:
+            continue
+        matches.append({
+            "name": name,
+            "rating": item.get("rating", ""),
+            "best": item.get("best", ""),
+            "description": item.get("description", ""),
+            "birds": item.get("birds", ""),
+            "tips": item.get("tips", ""),
+            "source": "static-beijing-guide",
+        })
+    return matches
+
+
+def find_static_hotspot_guide(hotspot_name: str) -> Optional[dict]:
+    """Find one static Beijing guide entry for a known hotspot alias."""
+    guides = _static_hotspot_guides(hotspot_name)
+    return guides[0] if guides else None
+
+
+def get_static_place_guide(place_name: str = "") -> dict:
+    """Return static Beijing place-guide entries for agent-side planning synthesis."""
+    return {
+        "region": "北京 (CN-11)",
+        "query": place_name,
+        "places": _static_hotspot_guides(place_name),
+    }
+
+
+def list_places(
+    region: Optional[str] = None,
+    province: Optional[str] = None,
+    query: str = "",
+    limit: int = 30,
+) -> dict:
+    """List live eBird hotspots for a region, with static Beijing fallback guides."""
+    params = _region_params(region, province)
+    source_errors = []
+    places = []
+    query_text = query.lower()
+    canonical_query = resolve_place(query).get("place", query).lower() if query else ""
+
+    with scoped_region(params):
+        active_region = resolve_region()
+        try:
+            hotspots = get_ebird().hotspot_list()
+            for hotspot in hotspots:
+                name = hotspot.get("locName", "")
+                name_lower = name.lower()
+                if canonical_query and canonical_query not in name_lower and query_text not in name_lower:
+                    continue
+                places.append({
+                    "name": name,
+                    "locId": hotspot.get("locId", ""),
+                    "lat": hotspot.get("lat", ""),
+                    "lng": hotspot.get("lng", ""),
+                    "lastDate": hotspot.get("lastDate", ""),
+                    "numSpecies": hotspot.get("numSpecies", ""),
+                    "numChecklists": hotspot.get("numChecklists", ""),
+                    "source": "eBird",
+                })
+        except Exception as e:
+            logger.info("Place list query failed: %s", e, exc_info=True)
+            source_errors.append({"source": "eBird", "message": str(e)})
+
+        if active_region.get("region") == "CN-11":
+            existing = {p.get("name") for p in places}
+            for guide in _static_hotspot_guides(query):
+                if guide["name"] not in existing:
+                    places.append(guide)
+
+        return {
+            "region": active_region,
+            "query": query,
+            "places": places[:limit],
+            "source_errors": source_errors,
+        }
+
+
+def get_place_recent_observations(
+    place_name: str,
+    region: Optional[str] = None,
+    province: Optional[str] = None,
+    days_back: int = 7,
+    max_results: int = 30,
+) -> dict:
+    """Fetch recent eBird observations for a place/hotspot name in a scoped region."""
+    params = _region_params(region, province)
+    place = resolve_place(place_name).get("place", place_name)
+    with scoped_region(params):
+        data = query_hotspot(place, days_back=days_back, max_results=max_results)
+        if isinstance(data, dict):
+            return {**data, "region": resolve_region(), "query": place_name, "resolved_place": place}
+        return {"error": "Unexpected hotspot query response", "region": resolve_region(), "query": place_name}
+
+
+def get_species_status(
+    species_name: str,
+    region: Optional[str] = None,
+    province: Optional[str] = None,
+    days_back: int = 30,
+) -> dict:
+    """Fetch recent status for a species using eBird plus birdrecord.cn."""
+    params = _region_params(region, province)
+    with scoped_region(params):
+        data = query_species_recent(species_name, days_back=days_back)
+        return {**data, "region": resolve_region(), "query": species_name}
+
+
+def get_notable_alerts(
+    region: Optional[str] = None,
+    province: Optional[str] = None,
+    days_back: int = 7,
+) -> dict:
+    """Fetch notable/rare sightings for a scoped region."""
+    params = _region_params(region, province)
+    with scoped_region(params):
+        return {
+            "region": resolve_region(),
+            "records": query_notable(days_back=days_back),
+        }
+
+
+def get_family_status(
+    family_cn_or_sci: str,
+    region: Optional[str] = None,
+    province: Optional[str] = None,
+    species_limit: int = 30,
+) -> dict:
+    """Fetch recent regional status for a bird family."""
+    family_sci = CN_FAMILY_MAP.get(family_cn_or_sci, family_cn_or_sci)
+    params = _region_params(region, province)
+    with scoped_region(params):
+        data = query_family(family_sci, species_limit=species_limit)
+        return {**data, "region": resolve_region(), "query": family_cn_or_sci}
+
+
+def get_seasonal_context(month: Optional[int] = None) -> dict:
+    """Return static seasonal context the agent can combine with live data."""
+    if month is None:
+        month = datetime.now().month
+    return {
+        "month": month,
+        "region": resolve_region(),
+        "summary": query_seasonal(month),
+    }
 
 
 def query_hotspot_rankings() -> list[dict]:
     """获取热点排名（按物种数，使用已配置的区域）。"""
-    eb = get_ebird()
     try:
+        eb = get_ebird()
         hotspots = eb.hotspot_list()
         def _sp(h):
             try:
                 return int(h.get("numSpecies", 0))
-            except:
+            except (TypeError, ValueError):
                 return 0
         hotspots.sort(key=_sp, reverse=True)
         return hotspots
     except Exception as e:
+        logger.info("Hotspot ranking query failed: %s", e, exc_info=True)
         return [{"error": str(e)}]
 
 
 def query_geo(lat: float, lng: float, dist_km: int = 10, days_back: int = 7) -> dict:
     """查询坐标周边鸟况。"""
-    eb = get_ebird()
     try:
+        eb = get_ebird()
         obs = eb.geo_recent(lat, lng, dist_km=dist_km, days_back=days_back, max_results=30)
         notable = eb.geo_notable(lat, lng, dist_km=dist_km, days_back=days_back*2, max_results=10)
         return {"observations": obs, "notable": notable}
     except Exception as e:
+        logger.info("Geo query failed for %s,%s: %s", lat, lng, e, exc_info=True)
         return {"error": str(e)}
 
 
@@ -555,7 +966,7 @@ def query_seasonal(month: int = None) -> str:
 _TAXONOMY_CACHE = None
 
 def _load_taxonomy() -> dict:
-    """从本地缓存加载完整的 eBird 物种分类（CN name → info）。"""
+    """从本地缓存加载完整的 eBird 物种分类（English name → info）。"""
     global _TAXONOMY_CACHE
     if _TAXONOMY_CACHE is not None:
         return _TAXONOMY_CACHE
@@ -565,8 +976,8 @@ def _load_taxonomy() -> dict:
             with open(map_path, "r", encoding="utf-8") as f:
                 _TAXONOMY_CACHE = json.load(f)
                 return _TAXONOMY_CACHE
-        except:
-            pass
+        except Exception as e:
+            logger.info("Failed to load taxonomy cache %s: %s", map_path, e, exc_info=True)
     _TAXONOMY_CACHE = {}
     return _TAXONOMY_CACHE
 
@@ -610,16 +1021,26 @@ def query_species_info(name: str) -> dict:
 
 def fmt_notable(data: list[dict]) -> str:
     """格式化稀有鸟讯（融合 eBird + birdrecord.cn）。"""
-    if not data:
+    errors = [o for o in data if o.get("error")]
+    records = [o for o in data if not o.get("error")]
+
+    if not records and errors:
+        lines = [f"⚠️ 暂时无法确认 {current_region_label()} 近期稀有鸟讯，因为数据源查询失败。"]
+        for err in errors:
+            lines.append(f"  - {err.get('source', 'unknown')}: {err.get('error', 'unknown error')}")
+        return "\n".join(lines)
+
+    if not records:
         return f"📡 已配置区域近期暂无稀有鸟种记录"
 
     lines = ["━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
              "  🚨 稀有鸟讯速递",
              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+    lines.append(f"  区域: {current_region_label()}")
 
     # 分离来源
-    from_ebird = [o for o in data if o.get("source") == "eBird"]
-    from_br = [o for o in data if o.get("source") == "birdrecord.cn"]
+    from_ebird = [o for o in records if o.get("source") == "eBird"]
+    from_br = [o for o in records if o.get("source") == "birdrecord.cn"]
 
     if from_ebird:
         lines.append("\n  📡 eBird 稀有记录:")
@@ -643,6 +1064,10 @@ def fmt_notable(data: list[dict]) -> str:
     total_ebird = len(from_ebird)
     total_br = len(from_br)
     lines.append(f"\n  📊 共 {total_ebird} 条 eBird 稀有记录 + {total_br} 条 birdrecord.cn 低频记录")
+    if errors:
+        lines.append("\n  ⚠️ 部分数据源查询失败:")
+        for err in errors:
+            lines.append(f"    - {err.get('source', 'unknown')}: {err.get('error', 'unknown error')}")
     lines.append(f"  更新于 {datetime.now().strftime('%m-%d %H:%M')}")
     return "\n".join(lines)
 
@@ -651,14 +1076,22 @@ def fmt_species(data: dict, species_name: str) -> str:
     """格式化物种查询结果（融合 eBird + birdrecord.cn）。"""
     ebird_obs = data.get("ebird", [])
     br_data = data.get("birdrecord", {})
-    summary = data.get("summary", "")
+    errors = data.get("errors", [])
+    br_reports = br_data.get("total_reports", 0)
 
-    if not ebird_obs and not br_data:
+    if not ebird_obs and br_reports == 0 and errors:
+        lines = [f"⚠️ 暂时无法确认 {current_region_label()} **{species_name}** 的近期记录，因为数据源查询失败。"]
+        for err in errors:
+            lines.append(f"  - {err.get('source', 'unknown')}: {err.get('message', 'unknown error')}")
+        return "\n".join(lines)
+
+    if not ebird_obs and br_reports == 0:
         return f"🐦 已配置区域近期未发现 **{species_name}** 的记录"
 
     lines = [f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
              f"  🐦 {species_name} 近期区域记录",
              f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+    lines.append(f"  区域: {current_region_label()}")
 
     # 百科信息
     info = data.get("species_info", {})
@@ -688,7 +1121,6 @@ def fmt_species(data: dict, species_name: str) -> str:
                 lines.append(f"       还有 {len(loc_obs) - 3} 条记录")
 
     # birdrecord.cn 数据
-    br_reports = br_data.get("total_reports", 0)
     br_districts = br_data.get("districts", [])
     if br_reports > 0:
         lines.append(f"\n  📗 birdrecord.cn ({br_reports}次报告):")
@@ -696,6 +1128,11 @@ def fmt_species(data: dict, species_name: str) -> str:
             top_dists = sorted(br_districts, key=lambda x: -x['reportCount'])[:6]
             dist_str = " | ".join(f"{d['district']} {d['reportCount']}次" for d in top_dists)
             lines.append(f"    📊 各区分布: {dist_str}")
+
+    if errors:
+        lines.append("\n  ⚠️ 部分数据源查询失败:")
+        for err in errors:
+            lines.append(f"    - {err.get('source', 'unknown')}: {err.get('message', 'unknown error')}")
 
     lines.append(f"\n  📊 数据: eBird + birdrecord.cn · {datetime.now().strftime('%m-%d %H:%M')}")
     return "\n".join(lines)
@@ -711,8 +1148,9 @@ def query_family(family_sci: str, species_limit: int = 30) -> dict:
 
     构建方式：
       - 从 cn_species_map.json（全物种分类数据）匹配 familySciName
-      - 通过 COMMON_SPECIES 获取中文名（仅覆盖常见种，约 142 种）
-      - 仅对有中文名的物种查询 birdrecord.cn 和 eBird
+      - 一次性获取区域近期 eBird 记录，并按 familySciName 过滤
+      - 一次性获取 birdrecord.cn 区域频率，并按中文科名过滤
+      - species_limit 只限制展示数量，不限制统计范围
     """
     _, family_species = get_family_data()
     taxonomy = _load_taxonomy()
@@ -720,6 +1158,8 @@ def query_family(family_sci: str, species_limit: int = 30) -> dict:
     codes = family_species.get(family_sci, [])
     if not codes:
         return {"error": f"未找到科 {family_sci} 的物种数据"}
+
+    code_set = set(codes)
 
     # Build code → cn_name from COMMON_SPECIES (reverse lookup)
     code_to_cn: dict[str, str] = {}
@@ -740,65 +1180,117 @@ def query_family(family_sci: str, species_limit: int = 30) -> dict:
             family_en = info.get("familyComName", "")
             break
 
-    species_in_family = []
-    for code in codes[:species_limit]:
-        en_name = code_to_en.get(code, "")
-        cn_name = code_to_cn.get(code, "")
-        species_in_family.append({
-            "cn_name": cn_name,          # may be empty if not in COMMON_SPECIES
-            "en_name": en_name,
-            "code": code,
-        })
-
-    # Query frequency & observations (only for species with Chinese names)
-    br = get_birdrecord()
-    eb = get_ebird()
-
-    enriched = []
-    for sp in species_in_family:
-        cn_name = sp["cn_name"]
-        code = sp["code"]
-
-        # birdrecord.cn frequency (requires Chinese name)
-        reports = 0
-        top_districts = []
-        if cn_name:
-            try:
-                freq = br.get_species_frequency_by_district(cn_name, days_back=30)
-                reports = sum(f.get("reportCount", 0) for f in freq)
-                top_districts = sorted(freq, key=lambda x: -x.get("reportCount", 0))[:5]
-            except Exception:
-                pass  # no birdrecord.cn data for this species
-
-        # eBird recent observations
-        recent_obs = []
-        try:
-            recent_obs = eb.recent_observations(days_back=14, species_code=code)[:5]
-        except Exception:
-            pass
-
-        enriched.append({
-            **sp,
-            "frequency": {
-                "total_reports": reports,
-                "districts": top_districts,
-            },
-            "recent_obs": recent_obs,
-        })
-
     # Find the Chinese family name
-    family_cn = ""
-    for cn_f, sci_f in CN_FAMILY_MAP.items():
-        if sci_f == family_sci:
-            family_cn = cn_f
-            break
+    family_cn_candidates = [cn_f for cn_f, sci_f in CN_FAMILY_MAP.items() if sci_f == family_sci]
+    family_cn = family_cn_candidates[0] if family_cn_candidates else ""
+
+    errors = []
+    ebird_by_code: dict[str, list[dict]] = {}
+    try:
+        eb = get_ebird()
+        recent_obs = eb.recent_observations(days_back=14, max_results=10000)
+        for obs in recent_obs:
+            code = obs.get("speciesCode", "")
+            if code in code_set:
+                ebird_by_code.setdefault(code, []).append(obs)
+    except Exception as e:
+        logger.info("eBird family query failed for %s: %s", family_sci, e, exc_info=True)
+        errors.append({"source": "eBird", "message": str(e)})
+
+    birdrecord_by_key: dict[str, dict] = {}
+    try:
+        br = get_birdrecord()
+        br_species = br.get_species_frequency(days_back=30)
+        if family_cn_candidates:
+            br_species = [
+                s for s in br_species
+                if s.get("taxonFamily") in family_cn_candidates
+            ]
+        else:
+            br_species = []
+
+        for item in br_species:
+            cn_name = item.get("species", "")
+            code = CN_TO_CODE.get(cn_name)
+            key = code or f"birdrecord:{cn_name}"
+            birdrecord_by_key[key] = {
+                "cn_name": cn_name,
+                "en_name": item.get("englishName", ""),
+                "code": code or "",
+                "reportCount": item.get("reportCount", 0),
+                "districts": [],
+            }
+
+        top_for_districts = sorted(
+            birdrecord_by_key.values(),
+            key=lambda x: -x.get("reportCount", 0),
+        )[:min(species_limit, 10)]
+        for item in top_for_districts:
+            cn_name = item.get("cn_name", "")
+            if cn_name:
+                item["districts"] = sorted(
+                    br.get_species_frequency_by_district(cn_name, days_back=30),
+                    key=lambda x: -x.get("reportCount", 0),
+                )[:5]
+    except Exception as e:
+        logger.info("BirdRecord family query failed for %s: %s", family_sci, e, exc_info=True)
+        errors.append({"source": "birdrecord.cn", "message": str(e)})
+
+    enriched_by_key: dict[str, dict] = {}
+    for code, obs in ebird_by_code.items():
+        enriched_by_key[code] = {
+            "cn_name": code_to_cn.get(code, ""),
+            "en_name": code_to_en.get(code, obs[0].get("comName", "")),
+            "code": code,
+            "frequency": {
+                "total_reports": 0,
+                "districts": [],
+            },
+            "recent_obs": obs[:5],
+        }
+
+    for key, item in birdrecord_by_key.items():
+        code = item.get("code", "")
+        target_key = code or key
+        entry = enriched_by_key.setdefault(target_key, {
+            "cn_name": item.get("cn_name", ""),
+            "en_name": item.get("en_name", ""),
+            "code": code,
+            "frequency": {
+                "total_reports": 0,
+                "districts": [],
+            },
+            "recent_obs": [],
+        })
+        if item.get("cn_name") and not entry.get("cn_name"):
+            entry["cn_name"] = item["cn_name"]
+        if item.get("en_name") and not entry.get("en_name"):
+            entry["en_name"] = item["en_name"]
+        entry["frequency"] = {
+            "total_reports": item.get("reportCount", 0),
+            "districts": item.get("districts", []),
+        }
+
+    enriched = sorted(
+        enriched_by_key.values(),
+        key=lambda sp: (
+            -sp.get("frequency", {}).get("total_reports", 0),
+            -len(sp.get("recent_obs", [])),
+            sp.get("cn_name") or sp.get("en_name") or "",
+        ),
+    )
 
     return {
         "family_cn": family_cn,
         "family_sci": family_sci,
         "family_en": family_en,
         "total_codes": len(codes),
-        "species_list": enriched,
+        "recorded_species_count": len(enriched),
+        "ebird_species_count": len(ebird_by_code),
+        "birdrecord_species_count": len(birdrecord_by_key),
+        "species_display_limit": species_limit,
+        "species_list": enriched[:species_limit],
+        "errors": errors,
     }
 
 
@@ -818,12 +1310,31 @@ def fmt_family(data: dict) -> str:
     family_cn = data.get("family_cn", "")
     family_en = data.get("family_en", "")
     total_codes = data.get("total_codes", 0)
+    recorded_species_count = data.get("recorded_species_count", 0)
+    ebird_species_count = data.get("ebird_species_count", 0)
+    birdrecord_species_count = data.get("birdrecord_species_count", 0)
+    display_limit = data.get("species_display_limit", 30)
     species_list = data.get("species_list", [])
+    errors = data.get("errors", [])
 
     title = f"{family_cn}({family_en})" if family_cn else f"{family_en or data.get('family_sci','')}"
-    has_record = [s for s in species_list if s["frequency"]["total_reports"] > 0 or s["recent_obs"]]
 
-    lines.append(f"  🌿 {title} — 该科 {total_codes} 种，区域内近期有记录 {len(has_record)} 种")
+    if not species_list and errors:
+        lines.append(f"  🌿 {title} — 分类库该科 {total_codes} 种")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"  区域: {current_region_label()}")
+        lines.append("  ⚠️ 暂时无法确认该科的区域近期记录，因为数据源查询失败。")
+        for err in errors:
+            lines.append(f"    - {err.get('source', 'unknown')}: {err.get('message', 'unknown error')}")
+        lines.append(f"\n  📊 数据: eBird + birdrecord.cn · {datetime.now().strftime('%m-%d %H:%M')}")
+        return "\n".join(lines)
+
+    lines.append(
+        f"  🌿 {title} — 分类库该科 {total_codes} 种；"
+        f"区域近期至少 {recorded_species_count} 种有记录"
+    )
+    lines.append(f"     区域: {current_region_label()}")
+    lines.append(f"     eBird {ebird_species_count} 种 | birdrecord.cn {birdrecord_species_count} 种")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     for sp in species_list:
@@ -834,16 +1345,6 @@ def fmt_family(data: dict) -> str:
         reports = freq.get("total_reports", 0)
         districts = freq.get("districts", [])
         recent = sp.get("recent_obs", [])
-
-        # Skip species with zero data unless they have a Chinese name
-        if reports == 0 and not recent:
-            if not cn:
-                continue  # skip unknown species with no records
-            # For species without Chinese name, still show a minimal entry
-            label = f"{en}" if not cn else f"{cn}({en})"
-            label += f" — ❌ 暂无该区域记录"
-            lines.append(f"  ▸ {label}")
-            continue
 
         cn_name_missing = not cn
         label = f"{cn}({en})" if cn else en
@@ -865,8 +1366,16 @@ def fmt_family(data: dict) -> str:
 
         lines.extend(parts)
 
-    if not has_record:
+    if recorded_species_count > len(species_list):
+        lines.append(f"  ... 仅展示前 {display_limit} 种，另有 {recorded_species_count - len(species_list)} 种未展开")
+
+    if not species_list and not errors:
         lines.append("  📭 区域内近期暂无该科鸟类记录")
+
+    if errors:
+        lines.append("\n  ⚠️ 部分数据源查询失败:")
+        for err in errors:
+            lines.append(f"    - {err.get('source', 'unknown')}: {err.get('message', 'unknown error')}")
 
     lines.append(f"\n  📊 数据: eBird + birdrecord.cn · {datetime.now().strftime('%m-%d %H:%M')}")
     return "\n".join(lines)
@@ -886,8 +1395,12 @@ def fmt_hotspot(data: dict) -> str:
     lines = [f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
              f"  📍 {name}",
              f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+             f"  区域: {current_region_label()}",
              f"  历史记录: {species_cnt} 种",
              f"  最近活跃: {last_date}", ""]
+    if data.get("fallback_used"):
+        lines.append("  注: 精确匹配热点近期无记录，已使用相关活跃子热点。")
+        lines.append("")
     
     if obs:
         # 按日期分组
@@ -922,6 +1435,7 @@ def fmt_rankings(data: list[dict]) -> str:
     lines = ["━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
              "  🏆 观鸟热点 TOP 15",
              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+    lines.append(f"  区域: {current_region_label()}")
     for i, h in enumerate(data[:15], 1):
         name = h.get("locName", "?")
         sp = h.get("numSpecies", "?")
@@ -982,9 +1496,12 @@ def query_birds(query: str) -> str:
       格式化字符串，可直接发送给用户
     """
     classified = classify_query(query)
-    intent = classified["intent"]
     params = classified["params"]
-    
+    with scoped_region(params):
+        return _dispatch_query(classified["intent"], params)
+
+
+def _dispatch_query(intent: str, params: dict) -> str:
     if intent == "notable":
         data = query_notable(days_back=7)
         return fmt_notable(data)
@@ -1020,7 +1537,7 @@ def query_birds(query: str) -> str:
         hotspot = params.get("hotspot", "")
         data = query_hotspot(hotspot)
         return fmt_hotspot(data)
-    
+
     elif intent == "geo":
         lat = params.get("lat")
         lng = params.get("lng")
